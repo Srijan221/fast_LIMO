@@ -5,12 +5,12 @@ fast_limo:
     topics:
       input:
         lidar: /ouster/points
-        imu: /ouster/imu
+        imu: /vectornav/imu
       # output:
 
     frames: # output frames (the transform between frames will be broadcasted)
       world: map
-      body: base_link
+      body: lidar
       tf_pub: true
 
     num_threads: 20 # OpenMP threads (will be equal to $(nproc) if it is set higher)

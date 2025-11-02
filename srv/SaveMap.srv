@@ -1,0 +1,11 @@
+# Request
+string path
+bool binary
+bool crop
+float32 min_z
+float32 max_z
+---
+# Response
+bool ok
+string message
+

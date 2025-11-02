@@ -16,6 +16,13 @@
  */
 
 #include "ROSutils.hpp"
+#include <mutex>
+#include <filesystem>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl/io/pcd_io.h>
+#include <pcl/filters/voxel_grid.h>
+#include <std_srvs/srv/trigger.hpp>
+#include "fast_limo/srv/save_map.hpp"
 
 namespace ros2wrap {
 
@@ -47,6 +54,17 @@ namespace ros2wrap {
             rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr body_pub;
             rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr map_bb_pub;
             rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr match_points_pub;
+
+            pcl::PointCloud<pcl::PointXYZI>::Ptr accumulated_map_{new pcl::PointCloud<pcl::PointXYZI>};
+            std::mutex accum_mutex_;
+            size_t max_points_accum_ = 12'000'000;   // can be made a param if you like
+            double voxel_leaf_accum_ = 0.0;   
+            // ---- Save-map service state ----
+            sensor_msgs::msg::PointCloud2 last_pointcloud_;
+            std::mutex last_pc_mutex_;
+            rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr final_map_pub_;
+            rclcpp::Service<fast_limo::srv::SaveMap>::SharedPtr save_map_srv_;
+            rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr   send_pc_srv_;
 
                 // TF 
             std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -92,6 +110,115 @@ namespace ros2wrap {
                     finalraw_pub = this->create_publisher<sensor_msgs::msg::PointCloud2>("/fast_limo/final_raw", 1);
                     body_pub     = this->create_publisher<nav_msgs::msg::Odometry>("/fast_limo/body", 1);
                     match_points_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/fast_limo/match_points", 1);
+                    // Params (optional): set defaults or read from your YAML if you prefer
+                    this->declare_parameter<double>("accumulate_voxel_leaf", voxel_leaf_accum_);  // 0.0 = off
+                    this->declare_parameter<int>("accumulate_max_points", static_cast<int>(max_points_accum_));
+                    voxel_leaf_accum_ = this->get_parameter("accumulate_voxel_leaf").as_double();
+                    max_points_accum_ = static_cast<size_t>(this->get_parameter("accumulate_max_points").as_int());
+
+                    // Latched /final_map publisher so RViz can see last published combined cloud
+                    {
+                    rclcpp::QoS latched_qos(1);
+                    latched_qos.transient_local().reliable().keep_last(1);
+                    final_map_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/fast_limo/final_map", latched_qos);
+                    }
+
+                    // /fast_limo/save_map : save the **accumulated** map
+                    save_map_srv_ = this->create_service<fast_limo::srv::SaveMap>(
+                    "/fast_limo/save_map",
+                    [this](const fast_limo::srv::SaveMap::Request::SharedPtr req,
+                            fast_limo::srv::SaveMap::Response::SharedPtr res)
+                    {
+                        pcl::PointCloud<pcl::PointXYZI>::Ptr to_save(new pcl::PointCloud<pcl::PointXYZI>);
+                        {
+                        std::scoped_lock lk(accum_mutex_);
+                        if (accumulated_map_->empty()) {
+                            res->ok = false;
+                            res->message = "Accumulated map is empty. Move the robot or wait for clouds.";
+                            RCLCPP_WARN(this->get_logger(), "%s", res->message.c_str());
+                            return;
+                        }
+                        *to_save = *accumulated_map_;  // copy
+                        }
+
+                        // Optional crop by z
+                        if (req->crop) {
+                        pcl::PointCloud<pcl::PointXYZI>::Ptr filtered(new pcl::PointCloud<pcl::PointXYZI>);
+                        filtered->reserve(to_save->size());
+                        for (const auto& p : to_save->points) {
+                            if (p.z >= req->min_z && p.z <= req->max_z) filtered->push_back(p);
+                        }
+                        filtered->width = static_cast<uint32_t>(filtered->size());
+                        filtered->height = 1; filtered->is_dense = false;
+                        to_save.swap(filtered);
+                        }
+
+                        // Ensure directory exists
+                        try {
+                        std::filesystem::path p(req->path);
+                        if (p.has_parent_path()) {
+                            std::error_code ec;
+                            std::filesystem::create_directories(p.parent_path(), ec);
+                            if (ec) {
+                            res->ok = false;
+                            res->message = "Failed to create directory: " + p.parent_path().string() + " (" + ec.message() + ")";
+                            RCLCPP_ERROR(this->get_logger(), "%s", res->message.c_str());
+                            return;
+                            }
+                        }
+                        } catch (const std::exception& e) {
+                        res->ok = false; res->message = std::string("Path error: ") + e.what();
+                        RCLCPP_ERROR(this->get_logger(), "%s", res->message.c_str());
+                        return;
+                        }
+
+                        // Write to PCD
+                        try {
+                        int code = req->binary
+                            ? pcl::io::savePCDFileBinary(req->path, *to_save)
+                            : pcl::io::savePCDFileASCII (req->path, *to_save);
+
+                        if (code == 0) {
+                            res->ok = true; res->message = "Saved: " + req->path;
+                            RCLCPP_INFO(this->get_logger(), "%s", res->message.c_str());
+                        } else {
+                            res->ok = false; res->message = "PCD write error code: " + std::to_string(code);
+                            RCLCPP_ERROR(this->get_logger(), "%s", res->message.c_str());
+                        }
+                        } catch (const pcl::IOException& e) {
+                        res->ok = false; res->message = std::string("PCD IO exception: ") + e.what();
+                        RCLCPP_ERROR(this->get_logger(), "%s", res->message.c_str());
+                        } catch (const std::exception& e) {
+                        res->ok = false; res->message = std::string("Exception: ") + e.what();
+                        RCLCPP_ERROR(this->get_logger(), "%s", res->message.c_str());
+                        }
+                    }
+                    );
+
+                    // /fast_limo/send_pointcloud : publish the **accumulated** map (latched) for RViz
+                    send_pc_srv_ = this->create_service<std_srvs::srv::Trigger>(
+                    "/fast_limo/send_pointcloud",
+                    [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+                            std::shared_ptr<std_srvs::srv::Trigger::Response> res)
+                    {
+                        pcl::PointCloud<pcl::PointXYZI>::Ptr to_pub(new pcl::PointCloud<pcl::PointXYZI>);
+                        {
+                        std::scoped_lock lk(accum_mutex_);
+                        if (accumulated_map_->empty()) {
+                            res->success = false; res->message = "Accumulated map is empty.";
+                            return;
+                        }
+                        *to_pub = *accumulated_map_;
+                        }
+                        sensor_msgs::msg::PointCloud2 msg;
+                        pcl::toROSMsg(*to_pub, msg);
+                        msg.header.stamp = this->now();
+                        msg.header.frame_id = this->world_frame;  // or "map"
+                        final_map_pub_->publish(msg);
+                        res->success = true; res->message = "Published accumulated map on /fast_limo/final_map";
+                    }
+                    );
+
 
                     // Init TF broadcaster
                     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -125,7 +252,54 @@ namespace ros2wrap {
                 pcl::toROSMsg(*loc.get_pointcloud(), pc_ros);
                 pc_ros.header.stamp = this->get_clock()->now();
                 pc_ros.header.frame_id = this->world_frame;
+                {
+                std::scoped_lock lk(last_pc_mutex_);
+                last_pointcloud_ = pc_ros;
+                }
                 this->pc_pub->publish(pc_ros);
+                // ---- Accumulate into global map (frames already in world frame) ----
+                {
+                pcl::PointCloud<pcl::PointXYZI> cur;
+                try {
+                    pcl::fromROSMsg(pc_ros, cur);
+                } catch (...) {
+                    // Fallback if your cloud is XYZ only:
+                    pcl::PointCloud<pcl::PointXYZ> cur_xyz;
+                    pcl::fromROSMsg(pc_ros, cur_xyz);
+                    cur.reserve(cur_xyz.size());
+                    for (auto &p : cur_xyz.points) { pcl::PointXYZI pi; pi.x=p.x; pi.y=p.y; pi.z=p.z; pi.intensity=0.f; cur.push_back(pi); }
+                }
+
+                std::scoped_lock lk(accum_mutex_);
+                *accumulated_map_ += cur;
+
+                // Optional voxel downsample of the accumulated map
+                if (voxel_leaf_accum_ > 0.0) {
+                    pcl::VoxelGrid<pcl::PointXYZI> vox;
+                    vox.setLeafSize(voxel_leaf_accum_, voxel_leaf_accum_, voxel_leaf_accum_);
+                    vox.setInputCloud(accumulated_map_);
+                    pcl::PointCloud<pcl::PointXYZI>::Ptr f(new pcl::PointCloud<pcl::PointXYZI>);
+                    vox.filter(*f);
+                    accumulated_map_.swap(f);
+                }
+
+                // Memory guard
+                if (accumulated_map_->size() > max_points_accum_) {
+                    RCLCPP_WARN(this->get_logger(), "Accumulated map reached max_points (%zu) — keeping last %zu",
+                                accumulated_map_->size(), max_points_accum_);
+                    // Keep last N points (simple strategy: truncate from front)
+                    pcl::PointCloud<pcl::PointXYZI>::Ptr trimmed(new pcl::PointCloud<pcl::PointXYZI>);
+                    trimmed->reserve(max_points_accum_);
+                    // copy last max_points_accum_ points
+                    const size_t start = accumulated_map_->size() - max_points_accum_;
+                    trimmed->points.insert(trimmed->points.end(),
+                                        accumulated_map_->points.begin() + static_cast<long>(start),
+                                        accumulated_map_->points.end());
+                    trimmed->width = static_cast<uint32_t>(trimmed->points.size());
+                    trimmed->height = 1; trimmed->is_dense = false;
+                    accumulated_map_.swap(trimmed);
+                }
+                }
 
                 // Publish debugging pointclouds
                 sensor_msgs::msg::PointCloud2 orig_msg;
