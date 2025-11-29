@@ -143,12 +143,21 @@ target_include_directories(accumulate_map_node PUBLIC
 add_dependencies(accumulate_map_node ${PROJECT_NAME}__rosidl_generator_cpp)
 target_link_libraries(accumulate_map_node ${cpp_typesupport_target})
 
+# Odometry saver node
+add_executable(odometry_saver
+  src/odometry_saver.cpp
+)
+ament_target_dependencies(odometry_saver
+  rclcpp nav_msgs
+)
+
 # -------------------------
 # Install
 # -------------------------
 install(TARGETS
   ${PROJECT_NAME}_multi_exec
   accumulate_map_node
+  odometry_saver
   DESTINATION lib/${PROJECT_NAME}
 )
 
