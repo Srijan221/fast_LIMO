@@ -12,7 +12,7 @@ public:
     OdometrySaver() : Node("odometry_saver") {
         // Create results directory if it doesn't exist
         // Navigate from source file: src/ -> fast_LIMO/ -> submodules/ -> stereo-pipeline/
-        results_dir_ = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() / "results";
+        results_dir_ = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path() / "output" / "trajectories"; // **CHANGE TO DESIRED PATH**
         if (!std::filesystem::exists(results_dir_)) {
             std::filesystem::create_directories(results_dir_);
             RCLCPP_INFO(this->get_logger(), "Created results directory: %s", results_dir_.c_str());
